@@ -971,6 +971,30 @@ function syncStatus(kind){
 }
 
 /* 云端同步：本地变化推到云端；合并策略：数组类按项合并，日考勤合并去重 */
+/* 云端同步：本地变化推到云端；合并策略：数组类按项合并，日考勤合并去重
+   删除同步机制（tombstone）：删除的条目不直接从数组移除后硬丢，
+   而是记录到 state.tombstones（按 id 记录删除时间）。
+   合并时：云端条目若在 tombstones 中且删除时间更新，则不再合并回本地。
+   tombstones 本身保留最近 500 条，避免无限增长。 */
+function recordTombstones(arr, removed){
+  if(!state.tombstones) state.tombstones = {};
+  const now = Date.now();
+  (removed||[]).forEach(x=>{ state.tombstones[x.id] = Math.max(now, x.ts||0); });
+  const keys = Object.keys(state.tombstones);
+  if(keys.length > 500){
+    keys.sort((a,b)=>state.tombstones[a]-state.tombstones[b]);
+    keys.slice(0, keys.length-500).forEach(k=>delete state.tombstones[k]);
+  }
+  save("tombstones");
+}
+function aliveArr(local, remote, key="id"){
+  if(!Array.isArray(remote)) return local;
+  const tombs = state.tombstones || {};
+  return remote.filter(x=>{
+    const t = tombs[x[key]];
+    return !(t && t >= (x.ts||0));
+  });
+}
 let syncTimer = null;
 function queueSync(){
   clearTimeout(syncTimer);
@@ -995,17 +1019,25 @@ async function pushCloud(){
     let merged = {...state};
     if(remote && remote.content){
       const rc = remote.content;
+      if(Array.isArray(rc.tombstones)){
+        const rt = {};
+        rc.tombstones.forEach(x=>{ if(x&&x.id) rt[x.id]=x.ts||0; });
+        state.tombstones = {...(state.tombstones||{}), ...rt};
+      }
       ["todos","favs","excerpts","books","money"].forEach(k=>{
-        if(Array.isArray(rc[k])) merged[k] = mergeArr(state[k], rc[k]);
+        if(Array.isArray(rc[k])) merged[k] = mergeArr(state[k], aliveArr(state[k], rc[k]));
       });
       if(rc.reviews) merged.reviews = {...rc.reviews, ...state.reviews};
       if(rc.checkins) merged.checkins = Array.from(new Set([...rc.checkins, ...(state.checkins||[])]));
       if(rc.hydr && state.hydr.ts >= (rc.hydr.ts||0)) {} else if(rc.hydr) merged.hydr = state.hydr.ts ? state.hydr : rc.hydr;
     }
-    await Cloud.putJSON(file, merged, remote ? remote.sha : null);
+    /* 云端存储格式：tombstones 由对象转为数组 */
+    const toUpload = {...merged};
+    toUpload.tombstones = Object.entries(state.tombstones||{}).map(([id,ts])=>({id,ts}));
+    await Cloud.putJSON(file, toUpload, remote ? remote.sha : null);
     state = merged;
     /* 本地回写合并后的数据 */
-    ["todos","favs","excerpts","books","money","reviews","hydr","checkins"].forEach(k=>store.set(k, state[k]));
+    ["todos","favs","excerpts","books","money","reviews","hydr","checkins","tombstones"].forEach(k=>store.set(stateKey(k), state[k]));
     syncStatus("ok");
   }catch(e){
     syncStatus("err");
@@ -1018,8 +1050,14 @@ async function pullCloud(){
     const remote = await Cloud.getJSON(`data/${CUR.name}.json`);
     if(remote && remote.content){
       const rc = remote.content;
+      if(Array.isArray(rc.tombstones)){
+        const rt = {};
+        rc.tombstones.forEach(x=>{ if(x&&x.id) rt[x.id]=x.ts||0; });
+        state.tombstones = {...(state.tombstones||{}), ...rt};
+        store.set(stateKey("tombstones"), state.tombstones);
+      }
       ["todos","favs","excerpts","books","money"].forEach(k=>{
-        if(Array.isArray(rc[k])) state[k] = mergeArr(state[k], rc[k]);
+        if(Array.isArray(rc[k])) state[k] = mergeArr(state[k], aliveArr(state[k], rc[k]));
       });
       if(rc.reviews) state.reviews = {...rc.reviews, ...state.reviews};
       if(rc.checkins) state.checkins = Array.from(new Set([...rc.checkins, ...(state.checkins||[])]));
@@ -1050,6 +1088,7 @@ function loadState(){
     reviews: store.get(stateKey("reviews"), {}),
     hydr: store.get(stateKey("hydr"), {date:"", ml:0, log:[], ts:0}),
     checkins: store.get(stateKey("checkins"), []),
+    tombstones: store.get(stateKey("tombstones"), {}),
     theme: store.get("theme", "light"),
   };
 }
@@ -1255,6 +1294,8 @@ $$(".tf-btn").forEach(b=>b.addEventListener("click", ()=>{
   renderTodos();
 }));
 $("#todo-clear").addEventListener("click", ()=>{
+  const removed = state.todos.filter(t=>t.date===todayStr());
+  recordTombstones(state.todos, removed);
   state.todos = state.todos.filter(t=>t.date!==todayStr());
   save("todos");
   renderTodos(); renderCalendar(); renderDayList();
@@ -1268,6 +1309,8 @@ document.addEventListener("click", e=>{
   }
   const del = e.target.closest("[data-del]");
   if(del){
+    const removed = state.todos.filter(x=>x.id===del.dataset.del);
+    recordTombstones(state.todos, removed);
     state.todos = state.todos.filter(x=>x.id!==del.dataset.del);
     save("todos");
     renderTodos(); renderCalendar(); renderDayList();
